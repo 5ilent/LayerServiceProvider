@@ -1,0 +1,215 @@
+#include <stdio.h>
+#include <ws2spi.h>
+#include <windows.h>
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Rpcrt4.lib")
+GUID ProviderGuid;
+GUID ProviderChainGuid;
+
+typedef int (*_WSCWriteProviderOrder)(LPDWORD, DWORD);
+_WSCWriteProviderOrder WSCWriteProviderOrder;
+int setWSCWriteProviderOrder()
+{
+	HMODULE hDll = LoadLibraryW(L"ws2_32.dll");
+	WSCWriteProviderOrder = (_WSCWriteProviderOrder)GetProcAddress(hDll, "WSCWriteProviderOrder");
+	wprintf(L"WSCWriteProviderOrder address: 0x%p\n", WSCWriteProviderOrder);
+	return 0;
+}
+
+int showProviders()
+{
+	LPWSAPROTOCOL_INFOW info;
+	DWORD dwSize = 0;
+	DWORD num = 0;
+	WSCEnumProtocols(0, 0, &dwSize, 0);
+	info = (LPWSAPROTOCOL_INFOW)malloc(dwSize);
+	num = WSCEnumProtocols(0, info, &dwSize, 0);
+	if (SOCKET_ERROR == num)
+	{
+		wprintf(L"WSCEnumProtocols error.\n");
+		free(info);
+		return -1;
+	}
+	for (int i = 0; i < num; ++i)
+	{
+		wprintf(L"[%d] (%d) %s\n", info[i].dwCatalogEntryId, info[i].ProtocolChain.ChainLen, info[i].szProtocol);
+	}
+	free(info);
+	return 0;
+}
+
+LPWSAPROTOCOL_INFOW GetProvider(LPINT lpnTotalProtocols)
+{
+	LPWSAPROTOCOL_INFOW pProtoInfo = NULL;
+	DWORD dwSize = 0;
+	int nError;
+	WSCEnumProtocols(NULL, 0, &dwSize, &nError);
+	pProtoInfo = (LPWSAPROTOCOL_INFOW)malloc(dwSize);
+	*lpnTotalProtocols = WSCEnumProtocols(NULL, pProtoInfo, &dwSize, &nError);
+	return pProtoInfo;
+}
+
+int InstallProvider(WCHAR* wszDllPath)
+{
+	WCHAR wszLspName[] = L"cifLSP";
+	int nError = NO_ERROR;		// NO_ERROR = 0
+	LPWSAPROTOCOL_INFOW pProtoInfo;
+	int nProtocols;
+	WSAPROTOCOL_INFOW udpLayeredInfo, udpChainInfo;		// Óû°²×°µÄudp·Ö²ãÐ­ÒéºÍÐ­ÒéÁ´
+	DWORD dwUdpOriginalCatalogId, dwLayeredCatalogId;
+
+	pProtoInfo = GetProvider(&nProtocols);
+	for (int i = 0; i < nProtocols; ++i)
+	{
+		if (pProtoInfo[i].iAddressFamily == AF_INET
+			&& pProtoInfo[i].iProtocol == IPPROTO_TCP
+			&& pProtoInfo[i].ProtocolChain.ChainLen == 1)
+		{
+			memcpy(&udpChainInfo, &pProtoInfo[i], sizeof(udpLayeredInfo));
+			udpChainInfo.dwServiceFlags1 &= (~XP1_IFS_HANDLES);
+			// ±£ÁôÔ­À´µÄÈë¿Úid
+			dwUdpOriginalCatalogId = pProtoInfo[i].dwCatalogEntryId;
+			wprintf(L"Selected protocol: [%d] (%d) %s\n", pProtoInfo[i].dwCatalogEntryId, pProtoInfo[i].ProtocolChain.ChainLen, pProtoInfo[i].szProtocol);
+			break;
+		}
+	}
+
+	// Ê×ÏÈ°²×°·Ö²ãÐ­Òé£¬»ñÈ¡Ò»¸öwinsock¿â°²ÅÅµÄÄ¿Â¼idºÅ£¬¼´dwLayeredCatalogId
+	// Ö±½ÓÊ¹ÓÃÏÂ²ãÐ­ÒéµÄWSAPROTOCOL_INFOW½á¹¹¼´¿É
+	memcpy(&udpLayeredInfo, &udpChainInfo, sizeof(udpLayeredInfo));
+	// ÐÞ¸ÄÐ­ÒéµÄÃû³Æ¡¢ÀàÐÍ£¬ÉèÖÃPFL_HIDDEN±êÖ¾
+	wcscpy(udpLayeredInfo.szProtocol, wszLspName);
+	udpLayeredInfo.ProtocolChain.ChainLen = LAYERED_PROTOCOL;	//	0
+	udpLayeredInfo.dwProviderFlags |= PFL_HIDDEN;
+	CoCreateGuid(&ProviderGuid);
+
+	// °²×°
+	if (WSCInstallProvider(&ProviderGuid, wszDllPath, &udpLayeredInfo, 1, &nError) == SOCKET_ERROR)
+	{
+		wprintf(L"\n\nWSCInstallProvider error.\nError code: %d\n", nError);
+		return nError;
+	}
+
+	// ÖØÐÂÃ¶¾ÙÐ­Òé£¬»ñÈ¡·Ö²ãÐ­ÒéÄ¿Â¼IDºÅ
+	free(pProtoInfo);
+	pProtoInfo = GetProvider(&nProtocols);
+	for (int i = 0; i < nProtocols; i++)
+	{
+		if (memcmp(&pProtoInfo[i].ProviderId, &ProviderGuid, sizeof(ProviderGuid)) == 0)
+		{
+			dwLayeredCatalogId = pProtoInfo[i].dwCatalogEntryId;
+			wprintf(L"my lsp provider CatalogId: %d\n", dwLayeredCatalogId);
+			break;
+		}
+	}
+	// °²×°Ð­ÒéÁ´
+	WCHAR wszChainName[WSAPROTOCOL_LEN + 1];
+	swprintf(wszChainName, L"%ws_over_%ws", wszLspName, udpChainInfo.szProtocol);
+	wcscpy(udpChainInfo.szProtocol, wszChainName);
+	if (udpChainInfo.ProtocolChain.ChainLen == 1)
+	{
+		// »ù´¡Ð­Òé£¬Ôò·Åµ½µÚ¶þ¸öÔªËØÎ»ÖÃ
+		udpChainInfo.ProtocolChain.ChainEntries[1] = dwUdpOriginalCatalogId;
+	}
+	else
+	{
+		for (int i = udpChainInfo.ProtocolChain.ChainLen; i > 0; --i)
+		{
+			// Ð­ÒéÁ´£¬ÔòÔ­Ð­ÒéÈë¿ÚÖð¸öºóÒÆ
+			udpChainInfo.ProtocolChain.ChainEntries[i] = udpChainInfo.ProtocolChain.ChainEntries[i - 1];
+		}
+	}
+	udpChainInfo.ProtocolChain.ChainLen += 1;
+	udpChainInfo.ProtocolChain.ChainEntries[0] = dwLayeredCatalogId;
+	// °²×°Ð­ÒéÁ´
+	CoCreateGuid(&ProviderChainGuid);
+	if (WSCInstallProvider(&ProviderChainGuid, wszDllPath, &udpChainInfo, 1, &nError) == SOCKET_ERROR)
+	{
+		wprintf(L"\nWSCInstallProvider (install Provider chain) error.\nError code: %d\n\n", nError);
+		return nError;
+	}
+
+	// ÖØÐÂÅÅÐòwinsockÄ¿Â¼£¬½«ÎÒÃÇµÄÐ­ÒéÁ´·Åµ½µÚÒ»
+	free(pProtoInfo);
+	pProtoInfo = GetProvider(&nProtocols);
+	DWORD dwIds[30];
+	int nIndex = 0;
+	// Ìí¼ÓÎÒÃÇµÄÐ­ÒéÁ´
+	for (int i = 0; i < nProtocols; ++i)
+	{
+		if ((pProtoInfo[i].ProtocolChain.ChainLen > 1)
+			&& (pProtoInfo[i].ProtocolChain.ChainEntries[0] == dwLayeredCatalogId))
+			dwIds[nIndex++] = pProtoInfo[i].dwCatalogEntryId;
+	}
+	// Ìí¼ÓÆäËûµÄÐ­ÒéÁ´
+	for (int i = 0; i < nProtocols; ++i)
+	{
+		if ((pProtoInfo[i].ProtocolChain.ChainLen <= 1)
+			|| (pProtoInfo[i].ProtocolChain.ChainEntries[0] != dwLayeredCatalogId))
+			dwIds[nIndex++] = pProtoInfo[i].dwCatalogEntryId;
+	}
+	nError = WSCWriteProviderOrder(dwIds, nIndex);
+	free(pProtoInfo);
+	return 0;
+}
+
+void RemoveProvider()
+{
+	LPWSAPROTOCOL_INFOW pProtoInfo;
+	int nProtocols = 0;
+	DWORD dwLayeredCatalogId;
+	int nError;
+
+	// ¸ù¾ÝGUIDÈ¡µÃ·Ö²ãÐ­ÒéµÄÄ¿Â¼IDºÅ
+	pProtoInfo = GetProvider(&nProtocols);
+	int i = 0;
+	for (i = 0; i < nProtocols; ++i)
+	{
+		if (memcmp(&ProviderGuid, &pProtoInfo[i].ProviderId, sizeof(ProviderGuid)) == 0)
+		{
+			dwLayeredCatalogId = pProtoInfo[i].dwCatalogEntryId;
+			break;
+		}
+	}
+	if (i < nProtocols)
+	{
+		// Ê×ÏÈÒÆ³ýÐ­ÒéÁ´
+		for (i = 0; i < nProtocols; ++i)
+		{
+			if ((pProtoInfo[i].ProtocolChain.ChainLen > 1)
+				&& (pProtoInfo[i].ProtocolChain.ChainEntries[0] == dwLayeredCatalogId))
+			{
+				WSCDeinstallProvider(&pProtoInfo[i].ProviderId, &nError);
+			}
+		}
+		WSCDeinstallProvider(&ProviderGuid, &nError);
+	}
+}
+
+int main(int argc, char* argv[])
+{
+	wprintf(L"Begin...\n\n");
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+	setWSCWriteProviderOrder();
+	showProviders();
+	WCHAR lspDllPath[200];
+	wprintf(L"input the lsp dll path: ");
+	wscanf(L"%s", lspDllPath);
+	if (InstallProvider(lspDllPath) == ERROR_SUCCESS)
+	{
+		wprintf(L"Install success.\n");
+	}
+	else
+	{
+		wprintf(L"Install fails.\n\n");
+	}
+	showProviders();
+	wprintf(L"\n");
+	system("pause");
+	RemoveProvider();
+	wprintf(L"Uninstalled..................................................................\n\n");
+	showProviders();
+	wprintf(L"End...\n\n");
+	return 0;
+}
